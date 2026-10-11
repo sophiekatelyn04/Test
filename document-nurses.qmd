@@ -1,0 +1,238 @@
+---
+title: "Nurses Data Analysis"
+subtitle: "Companion document for STATX290 Test"
+format:
+  pdf
+editor: source
+---
+
+## Nurse data
+
+We are given access to US state-level registered nurse (RN) employment and wage panel data (see Practical 2). The dataset consists of one row per state per year, over the years  1998–2020, for 54 jurisdictions (the 50 states, DC, and three territories).
+
+```{r}
+#| label: read-data
+#| message: false
+#| warning: false
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+
+nurses <- read_csv("data/reg-nurses-dataworld-1998-2020.csv")
+nurses
+```
+
+
+### Research questions
+
+1. Are higher-wage states more/less likely to have an above-average concentration of registered nurses in the workforce (relative to the nation)?
+
+2. Does this relationship differ by region of the country?
+
+3. Has this relationship changed between 2010 and 2020?
+
+The dataset has variable `location_quotient`, a standard labour-economics metric which measures the ratio of a state's RN employment *share* of its own workforce to the *national* RN employment share. A value of 1 means "exactly the national average concentration of nurses". We can use this to help answer the above questions.
+
+## Data cleaning
+
+First step is to clean up the variable names.
+
+```{r}
+#| label: clean-names
+
+nurses <- nurses |>
+  janitor::clean_names()
+
+nurses
+```
+
+Next look at missingness.
+
+```{r}
+#| label: missingness-lq
+#| warning: false
+
+library(naniar)
+
+nurses |> gg_miss_upset()
+
+nurses |> mutate(pre_2010 = year < 2010) |> gg_miss_fct(pre_2010)
+
+nurses |> filter(is.na(location_quotient)) |> count(year)
+
+nurses |> filter(is.na(location_quotient) & year == 2017)
+
+nurses |> filter(is.na(annual_10th_percentile) & 
+                   is.na(annual_25th_percentile) &
+                   is.na(annual_75th_percentile) & 
+                   is.na(annual_90th_percentile) )
+
+```
+Now add region data to the nurse dataset.
+
+```{r}
+#| label: region
+
+region_lookup <- tibble::tibble(state = state.name, 
+                                region = as.character(state.region))
+
+region_lookup <- region_lookup |>
+  add_row(state = c("Guam","Puerto Rico", "Virgin Islands"), 
+          region = c("Other", "Other", "Other"))
+
+nurses <- nurses |> left_join(region_lookup, by = "state") 
+
+```
+
+
+## Exploratory Data Analysis
+
+```{r}
+#| label: quotient-trend-plot
+#| warning: false
+
+nurses |>
+  filter(region %in% c("North Central", "Northeast", "South", "West")) |>  
+  ggplot(aes(x = year, y = location_quotient, group = state)) +
+  geom_line() +
+  scale_y_continuous("Location Quotient") +
+  facet_wrap(~region) +
+  ggtitle("RN Location Quotient over time, by region") +
+  theme_bw()
+```
+
+
+```{r}
+#| label: quo-plot
+#| warning: false
+
+library(forcats)
+
+nurses |> 
+  filter(region %in% c("North Central", "Northeast", "South", "West")) |>
+  mutate(state = fct_reorder(state, location_quotient, .fun = median)) |>
+  ggplot(aes(x = state, y = location_quotient)) +
+  geom_boxplot() +
+  facet_wrap(~region, scales = "free_x") +
+  scale_y_continuous("Location Quotient") +
+  ggtitle("RN Location Quotient by State") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+```
+
+```{r}
+#| label: lq-distribution
+#| warning: false
+
+nurses |>
+  filter(!is.na(location_quotient)) |>
+  ggplot(aes(x = location_quotient)) +
+  geom_histogram(binwidth = 0.05) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  scale_x_continuous("Location quotient") +
+  ggtitle("Distribution of RN location quotient, 2010-2020, all states") +
+  theme_bw()
+```
+
+
+## Modelling
+
+We construct a binary outcome, `high_quo`, recording whether a state-year's
+location quotient exceeds 1 (more concentrated than the national average).
+
+We construct several candidate models with various covariates to evaluate. First, create the model data.
+
+```{r}
+#| label: construct-response
+
+model_data <- nurses |>
+  filter(!is.na(location_quotient), !is.na(hourly_wage_median)) |>
+  filter(!is.na(region)) |>
+  mutate(
+    high_quo = as.integer(location_quotient > 1),
+    year_c = year - 2015,
+    region = factor(region)
+  )
+
+model_data |> count(high_quo)
+model_data |> count(region)
+```
+Then we fit the candidate models.
+
+```{r}
+#| label: fit-nested
+
+M0 <- glm(high_quo ~ 1, 
+          data = model_data, family = binomial())
+M1 <- glm(high_quo ~ hourly_wage_median, 
+          data = model_data, family = binomial())
+M2 <- glm(high_quo ~ hourly_wage_median + year_c, 
+          data = model_data, family = binomial())
+M3 <- glm(high_quo ~ hourly_wage_median + year_c + region, 
+          data = model_data, family = binomial())
+
+summary(M3)
+
+```
+
+```{r}
+#| label: nested-lrt
+
+anova(M0, M1, M2, M3, test = "LRT")
+```
+
+```{r}
+#| label: state-level-summary
+
+model_data |>
+  filter(state %in% c("California", "North Carolina", "New York", "Alabama")) |>
+  group_by(state, region) |>
+  summarise(mean_lq = mean(location_quotient), 
+            pct_high_quo = mean(high_quo), .groups = "drop")
+```
+
+## Model performance and diagnostics
+
+Now we perform some model checks.
+
+```{r}
+#| label: cooks-distance
+
+plot(M3, which = 4)
+
+cooks_dist <- cooks.distance(M3)
+max(cooks_dist)
+
+model_data[c(31,211,475),]
+```
+
+No single state-year has a Cook's distance anywhere near the usual concern threshold of 1.
+
+```{r}
+#| label: auc
+#| message: false
+
+library(ROCR)
+
+pred_obj <- prediction(fitted(M3), model_data$high_quo)
+perf_obj <- performance(pred_obj, "tpr", "fpr")
+
+plot(perf_obj, main = "ROC curve - M3")
+abline(a = 0, b = 1, lty = 2, col = "grey")
+
+auc_value <- performance(pred_obj, "auc")@y.values[[1]]
+auc_value
+```
+
+```{r}
+#| label: confusion-matrix
+
+predicted_class <- as.integer(fitted(M3) > 0.5)
+table(predicted = predicted_class, actual = model_data$high_quo)
+
+mean(predicted_class == model_data$high_quo)
+```
+
+
